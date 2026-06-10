@@ -1,0 +1,6 @@
+{
+  "name": "Secure WebRTC P2P File Transfer",
+  "description": "An ultra-secure, anonymous, zero-knowledge peer-to-peer file transfer app using WebCrypto and WebRTC. No servers, no logs, pure in-memory encryption.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
