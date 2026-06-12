@@ -44,7 +44,7 @@ export default function App() {
   const [rekeyCount, setRekeyCount] = useState(0);
   const [roomIdHash, setRoomIdHash] = useState('');
   const [receiverPassword, setReceiverPassword] = useState('');
-  const [useStun, setUseStun] = useState(false);
+  const [useStun, setUseStun] = useState(true);
   const [stunServer, setStunServer] = useState('stun:stun.stunprotocol.org:3478');
   const [peerjsHost, setPeerjsHost] = useState('0.peerjs.com');
   const [peerjsPort, setPeerjsPort] = useState('443');
@@ -114,18 +114,29 @@ export default function App() {
     setConnState('idle');
   }, []);
 
-  const getIceServers = useCallback(() => {
-    if (!useStun || !stunServer.trim()) return [];
-    return [{ urls: stunServer.trim() }];
-  }, [useStun, stunServer]);
+  const DEFAULT_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'],
+      username: 'peerjs', credential: 'peerjsp' }
+  ];
 
-  const getPeerOpts = useCallback(() => ({
-    host: peerjsHost,
-    port: Number(peerjsPort) || 443,
-    secure: true,
-    debug: 3 as any,
-    config: { iceServers: getIceServers() }
-  }), [peerjsHost, peerjsPort, getIceServers]);
+  const getPeerOpts = useCallback(() => {
+    const opts: Record<string, any> = {
+      host: peerjsHost,
+      port: Number(peerjsPort) || 443,
+      secure: true,
+      debug: 3 as any,
+    };
+    if (useStun && stunServer.trim()) {
+      opts.config = {
+        iceServers: [
+          { urls: stunServer.trim() },
+          ...DEFAULT_ICE_SERVERS
+        ]
+      };
+    }
+    return opts;
+  }, [peerjsHost, peerjsPort, useStun, stunServer]);
 
   const doECDHExchange = useCallback(async (
     conn: any,
@@ -178,6 +189,7 @@ export default function App() {
   };
 
   const startReceiver = async (pw: string, rh: string) => {
+    cancelRef.current = false;
     setPhase('receiving');
     setStatusMsg('Verificando clave...');
     try {
@@ -192,7 +204,7 @@ export default function App() {
 
       setStatusMsg('Conectando al emisor...');
       setConnState('connecting');
-      const peer = new Peer();
+      const peer = new Peer(getPeerOpts());
       peerRef.current = peer;
 
       peer.on('error', (err) => {
@@ -215,6 +227,7 @@ export default function App() {
       let sessionHMAC: CryptoKey = derived.hmacKey;
       let pendingAES: CryptoKey | null = null;
       let pendingHMAC: CryptoKey | null = null;
+      const pendingChunks: Promise<void>[] = [];
 
       peer.once('open', () => {
         const conn = peer.connect(rh);
@@ -294,6 +307,8 @@ export default function App() {
                 return;
               }
               if (msg.type === 'complete') {
+                await Promise.all(pendingChunks);
+                pendingChunks.length = 0;
                 setStatusMsg('Verificando integridad...');
                 if (!meta) { setErrorMsg('Error: metadatos no recibidos'); setPhase('error'); return; }
                 const ordered: ArrayBuffer[] = [];
@@ -330,22 +345,23 @@ export default function App() {
             } catch {}
           } else if (typeof data === 'object' && data !== null && data.type === 'chunk') {
             if (!meta) return;
-            try {
-              const buf = base64ToBuf(data.data);
-              const pktView = new DataView(buf);
-              const idx = pktView.getUint32(0, false);
-              if (idx === 0xFFFFFFFF) {
-                return;
+            const p = (async () => {
+              try {
+                const buf = base64ToBuf(data.data);
+                const pktView = new DataView(buf);
+                const idx = pktView.getUint32(0, false);
+                if (idx === 0xFFFFFFFF) return;
+                const result = await decryptChunk(sessionAES, sessionHMAC, buf);
+                chunksRef.current.set(result.chunkIndex, result.plaintext);
+                setChunksOk((c) => c + 1);
+                setProgress(Math.min(100, Math.round((chunksRef.current.size / meta!.totalChunks) * 100)));
+                conn.send(JSON.stringify({ type: 'ack', chunkIndex: result.chunkIndex }));
+              } catch (err: any) {
+                setErrorMsg('Error al desencriptar chunk: ' + err.message);
+                setPhase('error');
               }
-              const result = await decryptChunk(sessionAES, sessionHMAC, buf);
-              chunksRef.current.set(result.chunkIndex, result.plaintext);
-              setChunksOk((c) => c + 1);
-              setProgress(Math.min(100, Math.round((chunksRef.current.size / meta!.totalChunks) * 100)));
-              conn.send(JSON.stringify({ type: 'ack', chunkIndex: result.chunkIndex }));
-            } catch (err: any) {
-              setErrorMsg('Error al desencriptar chunk: ' + err.message);
-              setPhase('error');
-            }
+            })();
+            pendingChunks.push(p);
           }
         });
       });
@@ -382,6 +398,7 @@ export default function App() {
 
   const handleGenerateLink = async () => {
     if (!file || !password.trim()) return;
+    cancelRef.current = false;
     try {
       setStatusMsg('Derivando claves...');
       const { roomId, aesKey, hmacKey, aesBits, hmacBits } = await deriveKeys(password.trim());
@@ -428,10 +445,12 @@ export default function App() {
         let ratchetCount = 0;
         let senderECDHPair: CryptoKeyPair | null = null;
 
+        const ecdhKeyPromise = generateECDHKeyPair();
+
         conn.on('open', async () => {
           setStatusMsg('Intercambiando claves ECDH...');
 
-          senderECDHPair = await generateECDHKeyPair();
+          senderECDHPair = await ecdhKeyPromise;
           const pubRaw = await exportPublicKey(senderECDHPair.publicKey);
           conn.send(JSON.stringify({ type: 'ecdh-pub', pubKey: bufToHex(pubRaw) }));
         });
@@ -460,8 +479,9 @@ export default function App() {
             try {
               const msg = JSON.parse(data);
               if (msg.type === 'ecdh-pub' && !ecdhReady) {
+                const pair = senderECDHPair ?? await ecdhKeyPromise;
                 const remotePub = await importPublicKey(hexToBuf(msg.pubKey));
-                const shared = await deriveECDHShared(senderECDHPair!.privateKey, remotePub);
+                const shared = await deriveECDHShared(pair.privateKey, remotePub);
                 const combined = await combineKeys(aesBits, hmacBits, shared);
                 sessionAES = combined.aesKey;
                 sessionHMAC = combined.hmacKey;
